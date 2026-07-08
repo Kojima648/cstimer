@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "build:local": "node scripts/build-local.js --lang=zh-cn",
+    "local": "node scripts/start-local.js --lang=zh-cn",
+    "local:8080": "node scripts/start-local.js --lang=zh-cn --port=8080",
+    "serve:local": "node scripts/start-local.js --skip-build --port=8080"
+  }
+}
