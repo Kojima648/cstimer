@@ -26,6 +26,10 @@ var puzzleFactory = execMain(function() {
 		return this.twistyScene.applyMoves(args);
 	};
 
+	Puzzle.prototype.setGyroQuaternion = function(args) {
+		return this.twistyScene.setGyroQuaternion && this.twistyScene.setGyroQuaternion(args);
+	};
+
 	Puzzle.prototype.addMoveListener = function(listener) {
 		return this.twistyScene.addMoveListener(listener);
 	};

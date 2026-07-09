@@ -403,6 +403,16 @@ window.twistyjs = (function() {
 			renderer.render(scene, camera);
 		}
 
+		this.setGyroQuaternion = function(quat) {
+			if (!twisty || !twisty._3d || !quat) {
+				return;
+			}
+			twisty._3d.useQuaternion = true;
+			twisty._3d.quaternion.set(quat.x, quat.y, quat.z, quat.w);
+			twisty._3d.matrixWorldNeedsUpdate = true;
+			render();
+		};
+
 		function moveCameraDelta(deltaTheta, deltaPhi) {
 			cameraTheta += deltaTheta;
 			cameraTheta = Math.max(Math.min(cameraTheta, 6), -6);

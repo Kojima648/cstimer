@@ -15,6 +15,15 @@ execMain(function(timer) {
 		var tmpCubie1 = new mathlib.CubieCube();
 		var puzzleObj;
 		var curOri = -1;
+		var gyroPreviewBaseInv = null;
+		var lastGyroPreviewRender = 0;
+		var GYRO_PREVIEW_RENDER_MS = 16;
+		var GYRO_PREVIEW_ZERO_QUAT = {
+			x: 0.7071067811865476,
+			y: 0,
+			z: 0.7071067811865476,
+			w: 0
+		};
 
 		function resetVRC(temp, force) {
 			if ((isReseted && !force) || !enableVRC) {
@@ -38,6 +47,8 @@ execMain(function(timer) {
 				if (!puzzleObj) {
 					return;
 				}
+				gyroPreviewBaseInv = null;
+				puzzleObj.setGyroQuaternion && puzzleObj.setGyroQuaternion({ x: 0, y: 0, z: 0, w: 1 });
 				var preScramble = puzzleObj.parseScramble('U2 U2', true);
 				curVRCCubie.ori = 0;
 				for (var i = 0; i < preScramble.length; i++) {
@@ -47,6 +58,9 @@ execMain(function(timer) {
 				var targetOri = kernel.getProp('giiOri');
 				targetOri = targetOri == 'auto' ? -1 : ~~targetOri;
 				setOri(targetOri);
+				if (gyroPreviewActive) {
+					setGyroGripPose();
+				}
 			});
 			isReseted = true;
 		}
@@ -106,10 +120,72 @@ execMain(function(timer) {
 			puzzleObj.applyMoves(puzzleObj.parseScramble(todoMoves.join(' ')));
 		}
 
+		function invertQuat(quat) {
+			return {
+				x: -quat.x,
+				y: -quat.y,
+				z: -quat.z,
+				w: quat.w
+			};
+		}
+
+		function mulQuat(a, b) {
+			return {
+				x: a.x * b.w + a.w * b.x + a.y * b.z - a.z * b.y,
+				y: a.y * b.w + a.w * b.y + a.z * b.x - a.x * b.z,
+				z: a.z * b.w + a.w * b.z + a.x * b.y - a.y * b.x,
+				w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+			};
+		}
+
+		function normalizeQuat(quat) {
+			var norm = Math.sqrt(quat.x * quat.x + quat.y * quat.y + quat.z * quat.z + quat.w * quat.w);
+			if (norm > 0.01) {
+				quat.x /= norm;
+				quat.y /= norm;
+				quat.z /= norm;
+				quat.w /= norm;
+			}
+			return quat;
+		}
+
+		function setGyroQuaternion(quat, locTime) {
+			if (!puzzleObj || !enableVRC || !quat || !puzzleObj.setGyroQuaternion) {
+				return false;
+			}
+			locTime = locTime || $.now();
+			if (locTime - lastGyroPreviewRender < GYRO_PREVIEW_RENDER_MS) {
+				return true;
+			}
+			lastGyroPreviewRender = locTime;
+			if (!gyroPreviewBaseInv) {
+				gyroPreviewBaseInv = invertQuat(quat);
+			}
+			puzzleObj.setGyroQuaternion(normalizeQuat(mulQuat(mulQuat(quat, gyroPreviewBaseInv), GYRO_PREVIEW_ZERO_QUAT)));
+			return true;
+		}
+
+		function setGyroGripPose() {
+			if (!puzzleObj || !enableVRC || !puzzleObj.setGyroQuaternion) {
+				return false;
+			}
+			puzzleObj.setGyroQuaternion(GYRO_PREVIEW_ZERO_QUAT);
+			return true;
+		}
+
+		function resetGyroQuaternion() {
+			gyroPreviewBaseInv = null;
+			lastGyroPreviewRender = 0;
+			puzzleObj && puzzleObj.setGyroQuaternion && puzzleObj.setGyroQuaternion({ x: 0, y: 0, z: 0, w: 1 });
+		}
+
 		return {
 			resetVRC: resetVRC, //reset to solved
 			setState: setState,
 			setOri: setOri,
+			setGyroQuaternion: setGyroQuaternion,
+			setGyroGripPose: setGyroGripPose,
+			resetGyroQuaternion: resetGyroQuaternion,
 			setSize: setSize
 		}
 	})();
@@ -181,6 +257,9 @@ execMain(function(timer) {
 			timer.updateMulPhase(totPhases, initialProgress, locTime);
 			timer.lcd.reset(enableVRC);
 			timer.lcd.fixDisplay(false, true);
+			if (gyroAutoSync) {
+				startAutoGyroCapture();
+			}
 		}
 		if (timer.status() >= 1) {
 			if (prevMoves.length > 0)
@@ -266,7 +345,160 @@ execMain(function(timer) {
 		enable ? div.show() : div.hide();
 		if (enable) {
 			giikerVRC.resetVRC(true, true);
+			startAutoGyroSync();
+		} else {
+			stopAutoGyroSync();
 		}
+	}
+
+	var gyroPreviewTid = 0;
+	var gyroPreviewActive = false;
+	var gyroPreviewCaptureActive = false;
+	var gyroAutoSync = false;
+	var gyroAutoCaptureActive = false;
+	var gyroDisplayActive = false;
+	var prevGyroHandler = null;
+
+	function resetGyroDisplay() {
+		gyroDisplayActive = false;
+		giikerVRC.resetGyroQuaternion();
+	}
+
+	function onMoyu32Gyro(data) {
+		if (prevGyroHandler) {
+			prevGyroHandler(data);
+		}
+		if (!data || !data.quaternion) {
+			return;
+		}
+		if (gyroPreviewActive || gyroAutoSync) {
+			gyroDisplayActive = true;
+			giikerVRC.setGyroQuaternion(data.quaternion, data.locTime);
+		} else if (gyroDisplayActive) {
+			resetGyroDisplay();
+		}
+	}
+
+	function installGyroHandler() {
+		if (typeof window == 'undefined') {
+			return false;
+		}
+		if (window.moyu32GyroHandler !== onMoyu32Gyro) {
+			prevGyroHandler = window.moyu32GyroHandler || null;
+			window.moyu32GyroHandler = onMoyu32Gyro;
+		}
+		return true;
+	}
+
+	function uninstallGyroHandler() {
+		if (typeof window == 'undefined' || window.moyu32GyroHandler !== onMoyu32Gyro) {
+			return;
+		}
+		if (prevGyroHandler !== null) {
+			window.moyu32GyroHandler = prevGyroHandler;
+			prevGyroHandler = null;
+		} else {
+			delete window.moyu32GyroHandler;
+		}
+	}
+
+	function startAutoGyroSync() {
+		if (!enable || !enableVRC || kernel.getProp('giiVRC') != 'v' || typeof window == 'undefined' || typeof window.moyu32CaptureGyro != 'function') {
+			return Promise.resolve(false);
+		}
+		gyroAutoSync = true;
+		installGyroHandler();
+		giikerVRC.setGyroGripPose();
+		return startAutoGyroCapture();
+	}
+
+	function startAutoGyroCapture() {
+		if (!gyroAutoSync || gyroAutoCaptureActive || typeof window == 'undefined' || typeof window.moyu32CaptureGyro != 'function') {
+			return Promise.resolve(false);
+		}
+		if (!GiikerCube.isConnected()) {
+			return Promise.resolve(false);
+		}
+		installGyroHandler();
+		gyroAutoCaptureActive = true;
+		return window.moyu32CaptureGyro(0, { 'silent': true, 'persistent': true }).catch(function() {
+			gyroAutoCaptureActive = false;
+			if (!gyroPreviewActive) {
+				uninstallGyroHandler();
+			}
+			return false;
+		});
+	}
+
+	function stopAutoGyroSync() {
+		gyroAutoSync = false;
+		return stopAutoGyroCapture(true);
+	}
+
+	function stopAutoGyroCapture(clearHandler) {
+		var wasActive = gyroAutoCaptureActive;
+		gyroAutoCaptureActive = false;
+		if (gyroPreviewActive) {
+			return Promise.resolve();
+		}
+		if (clearHandler) {
+			uninstallGyroHandler();
+		}
+		resetGyroDisplay();
+		if (wasActive && typeof window != 'undefined' && typeof window.moyu32StopGyroCapture == 'function') {
+			return window.moyu32StopGyroCapture();
+		}
+		return Promise.resolve();
+	}
+
+	function stopGyroPreview() {
+		if (gyroPreviewTid) {
+			clearTimeout(gyroPreviewTid);
+			gyroPreviewTid = 0;
+		}
+		var stopPreviewCapture = gyroPreviewCaptureActive;
+		gyroPreviewActive = false;
+		gyroPreviewCaptureActive = false;
+		if (gyroAutoCaptureActive) {
+			return Promise.resolve();
+		}
+		if (!gyroAutoSync) {
+			uninstallGyroHandler();
+		}
+		resetGyroDisplay();
+		if (stopPreviewCapture && typeof window != 'undefined' && typeof window.moyu32StopGyroCapture == 'function') {
+			return window.moyu32StopGyroCapture();
+		}
+		return Promise.resolve();
+	}
+
+	function previewGyro(duration) {
+		if (typeof window == 'undefined' || typeof window.moyu32CaptureGyro != 'function') {
+			return Promise.reject('[giiker] WCU gyro capture is not available');
+		}
+		if (!enableVRC) {
+			return Promise.reject('[giiker] Enable Bluetooth virtual cube first');
+		}
+		duration = Math.max(500, Math.min(30000, ~~duration || 5000));
+		giikerVRC.resetVRC(true, true);
+		resetGyroDisplay();
+		giikerVRC.setGyroGripPose();
+		gyroPreviewActive = true;
+		gyroDisplayActive = true;
+		installGyroHandler();
+		if (gyroPreviewTid) {
+			clearTimeout(gyroPreviewTid);
+		}
+		gyroPreviewTid = setTimeout(stopGyroPreview, duration + 200);
+		if (gyroAutoCaptureActive) {
+			return Promise.resolve(true);
+		}
+		gyroPreviewCaptureActive = true;
+		return window.moyu32CaptureGyro(duration, { 'silent': true }).catch(function(err) {
+			gyroPreviewCaptureActive = false;
+			gyroPreviewActive = false;
+			throw err;
+		});
 	}
 
 	$(function() {
@@ -290,7 +522,9 @@ execMain(function(timer) {
 	function startConnect() {
 		giikerutil.setCallback(giikerCallback);
 		kernel.showDialog([$('<div>Press OK To Connect To Bluetooth Cube</div>').append(timer.getBTDiv()), function () {
-			giikerutil.init().catch(function(error) {
+			giikerutil.init().then(function() {
+				return startAutoGyroSync();
+			}).catch(function(error) {
 				giikerutil.log('[giiker] init failed', error);
 				alert(error);
 			});
@@ -303,7 +537,10 @@ execMain(function(timer) {
 			if (enable && !GiikerCube.isConnected()) {
 				startConnect();
 			} else if (!enable) {
+				stopAutoGyroSync();
 				giikerutil.stop();
+			} else if (enable) {
+				startAutoGyroSync();
 			}
 			setVRC(enable && kernel.getProp('giiVRC') != 'n');
 		},
@@ -341,4 +578,11 @@ execMain(function(timer) {
 		setVRC: setVRC,
 		setSize: giikerVRC.setSize
 	};
+
+	if (typeof window != 'undefined') {
+		window.moyu32EnableGyroSync = startAutoGyroSync;
+		window.moyu32DisableGyroSync = stopAutoGyroSync;
+		window.moyu32PreviewGyro = previewGyro;
+		window.moyu32StopGyroPreview = stopGyroPreview;
+	}
 }, [timer]);

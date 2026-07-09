@@ -15,6 +15,11 @@ execMain(function() {
 	var moveCnt = -1;
 	var prevMoveCnt = -1;
 	var batteryLevel = 0;
+	var gyroCapture = false;
+	var gyroCaptureSilent = false;
+	var gyroCaptureStopTid = 0;
+	var gyroCapturePackets = 0;
+	var lastGyroLogTs = 0;
 
 	var SERVICE_UUID = '0783b03e-7735-b5a0-1760-a305d2795cb0';
 	var CHRT_UUID_READ = '0783b03e-7735-b5a0-1760-a305d2795cb1';
@@ -124,6 +129,69 @@ execMain(function() {
 		return sendSimpleRequest(164);
 	}
 
+	function requestCubeGyro(enable) {
+		var req = mathlib.valuedArray(20, 0);
+		req[0] = 172;
+		req[2] = enable ? 1 : 0;
+		return sendRequest(req);
+	}
+
+	function stopGyroCapture() {
+		if (gyroCaptureStopTid) {
+			clearTimeout(gyroCaptureStopTid);
+			gyroCaptureStopTid = 0;
+		}
+		var packets = gyroCapturePackets;
+		var silent = gyroCaptureSilent;
+		gyroCapture = false;
+		gyroCaptureSilent = false;
+		gyroCapturePackets = 0;
+		lastGyroLogTs = 0;
+		var promise = _chrct_write ? requestCubeGyro(false) : Promise.resolve();
+		return Promise.resolve(promise).catch($.noop).then(function() {
+			if (!silent && typeof console != 'undefined' && console.log) {
+				console.log('[Moyu32Cube] gyro capture stopped, packets=' + packets);
+			}
+			!silent && giikerutil.log('[Moyu32Cube] gyro capture stopped, packets=' + packets);
+			return packets;
+		});
+	}
+
+	function captureGyro(duration, options) {
+		if (!_chrct_write) {
+			return Promise.reject('[Moyu32Cube] Cannot capture gyro before cube is connected');
+		}
+		options = options || {};
+		duration = ~~duration;
+		var persistent = !!options['persistent'] || duration <= 0;
+		if (!persistent) {
+			duration = Math.max(500, Math.min(30000, duration || 5000));
+		}
+		gyroCapture = true;
+		gyroCaptureSilent = !!options['silent'];
+		gyroCapturePackets = 0;
+		lastGyroLogTs = 0;
+		if (gyroCaptureStopTid) {
+			clearTimeout(gyroCaptureStopTid);
+		}
+		return Promise.resolve(requestCubeGyro(true)).then(function() {
+			if (!persistent) {
+				gyroCaptureStopTid = setTimeout(stopGyroCapture, duration);
+			}
+			if (!gyroCaptureSilent && typeof console != 'undefined' && console.log) {
+				console.log('[Moyu32Cube] gyro capture started' + (persistent ? '' : ' for ' + duration + 'ms'));
+			}
+			!gyroCaptureSilent && giikerutil.log('[Moyu32Cube] gyro capture started' + (persistent ? '' : ' for ' + duration + 'ms'));
+			return true;
+		}, function(err) {
+			gyroCapture = false;
+			gyroCaptureSilent = false;
+			gyroCapturePackets = 0;
+			lastGyroLogTs = 0;
+			throw err;
+		});
+	}
+
 	function getManufacturerDataBytes(mfData) {
 		if (mfData instanceof DataView) { // this is workaround for Bluefy browser
 			return new DataView(mfData.buffer.slice(2));
@@ -230,6 +298,10 @@ execMain(function() {
 			return requestCubeStatus();
 		}).then(function () {
 			return requestCubePower();
+		}).then(function () {
+			if (/^WCU_MY32/.exec(deviceName)) {
+				return requestCubeGyro(false);
+			}
 		});
 	}
 
@@ -257,11 +329,13 @@ execMain(function() {
 
 	function parseData(value) {
 		var locTime = $.now();
-		value = decode(value);
-		for (var i = 0; i < value.length; i++) {
-			value[i] = (value[i] + 256).toString(2).slice(1);
+		var bytes = decode(value);
+		var valueBits = [];
+		for (var i = 0; i < bytes.length; i++) {
+			bytes[i] &= 0xff;
+			valueBits[i] = (bytes[i] + 256).toString(2).slice(1);
 		}
-		value = value.join('');
+		value = valueBits.join('');
 		var msgType = parseInt(value.slice(0, 8), 2);
 		if (msgType == 161) { // info
 			giikerutil.log('[Moyu32Cube] received hardware info event', value);
@@ -302,7 +376,70 @@ execMain(function() {
 			if (!invalidMove) {
 				updateMoveTimes(locTime);
 			}
-		// } else if (msgType == 171) { // gyro
+		} else if (msgType == 171 && gyroCapture) { // gyro
+			parseGyroData(bytes, locTime);
+		} else if (msgType == 172 && gyroCapture) { // gyro status
+			!gyroCaptureSilent && giikerutil.log('[Moyu32Cube] gyro status functional=' + bytes[1] + ', enabled=' + bytes[2]);
+			if (!gyroCaptureSilent && typeof console != 'undefined' && console.log) {
+				console.log('[Moyu32Cube] gyro status', {
+					functional: bytes[1],
+					enabled: bytes[2],
+					rawHex: formatBytes(bytes)
+				});
+			}
+		}
+	}
+
+	function formatBytes(bytes) {
+		return bytes.map(function(byte) {
+			return (byte + 0x100).toString(16).slice(1).toUpperCase();
+		}).join(' ');
+	}
+
+	function parseGyroData(bytes, locTime) {
+		if (bytes.length < 17) {
+			giikerutil.log('[Moyu32Cube] invalid gyro packet length=' + bytes.length);
+			return;
+		}
+		function getInt32LE(offset) {
+			return bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24;
+		}
+		var scale = 0x40000000;
+		var w = getInt32LE(1) / scale;
+		var x = getInt32LE(5) / scale;
+		var z = -getInt32LE(9) / scale;
+		var y = getInt32LE(13) / scale;
+		var norm = Math.sqrt(x * x + y * y + z * z + w * w);
+		if (norm > 0.01) {
+			x /= norm;
+			y /= norm;
+			z /= norm;
+			w /= norm;
+		}
+		gyroCapturePackets++;
+		var data = {
+			deviceName: deviceName,
+			locTime: locTime,
+			rawHex: formatBytes(bytes),
+			quaternion: {
+				x: x,
+				y: y,
+				z: z,
+				w: w
+			}
+		};
+		if (typeof window != 'undefined') {
+			window.moyu32LastGyro = data;
+			if (typeof window.moyu32GyroHandler == 'function') {
+				window.moyu32GyroHandler(data);
+			}
+		}
+		if (!gyroCaptureSilent && locTime - lastGyroLogTs > 200) {
+			lastGyroLogTs = locTime;
+			if (typeof console != 'undefined' && console.log) {
+				console.log('[Moyu32Cube] gyro', data);
+			}
+			giikerutil.log('[Moyu32Cube] gyro quaternion x=' + x.toFixed(4) + ', y=' + y.toFixed(4) + ', z=' + z.toFixed(4) + ', w=' + w.toFixed(4));
 		}
 	}
 
@@ -357,6 +494,9 @@ execMain(function() {
 
 	function clear() {
 		var result = Promise.resolve();
+		if (_chrct_write && gyroCapture) {
+			result = stopGyroCapture().catch($.noop);
+		}
 		_gatt = null;
 		_service = null;
 		if (_chrct_read) {
@@ -377,8 +517,17 @@ execMain(function() {
 		moveCnt = -1;
 		prevMoveCnt = -1;
 		batteryLevel = 0;
+		gyroCapture = false;
+		gyroCaptureSilent = false;
+		gyroCapturePackets = 0;
+		lastGyroLogTs = 0;
 
 		return result;
+	}
+
+	if (typeof window != 'undefined') {
+		window.moyu32CaptureGyro = captureGyro;
+		window.moyu32StopGyroCapture = stopGyroCapture;
 	}
 
 	GiikerCube.regCubeModel({
@@ -387,6 +536,8 @@ execMain(function() {
 		opservs: [SERVICE_UUID],
 		cics: MOYU32_CIC_LIST,
 		getBatteryLevel: getBatteryLevel,
+		'captureGyro': captureGyro,
+		'stopGyroCapture': stopGyroCapture,
 		clear: clear
 	});
 });
